@@ -1,0 +1,6 @@
+{
+  "name": "Jaanan - Romantic Music Sanctuary",
+  "description": "A dreamy, minimalist music website featuring the Urdu calligraphy جاناں, a daisy polaroid aesthetic, and an interactive YouTube playlist music player.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
