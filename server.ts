@@ -11,6 +11,54 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json());
 
+// In-Memory High-Performance TTL Cache
+interface CacheEntry<T> {
+  data: T;
+  expiresAt: number;
+}
+
+class SimpleMemoryCache {
+  private cache = new Map<string, CacheEntry<any>>();
+  private maxEntries: number;
+
+  constructor(maxEntries = 500) {
+    this.maxEntries = maxEntries;
+  }
+
+  get<T>(key: string): T | null {
+    const entry = this.cache.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      this.cache.delete(key);
+      return null;
+    }
+    return entry.data as T;
+  }
+
+  set<T>(key: string, data: T, ttlMs = 15 * 60 * 1000): void {
+    if (this.cache.size >= this.maxEntries) {
+      const firstKey = this.cache.keys().next().value;
+      if (firstKey) this.cache.delete(firstKey);
+    }
+    this.cache.set(key, {
+      data,
+      expiresAt: Date.now() + ttlMs,
+    });
+  }
+
+  clear(): void {
+    this.cache.clear();
+  }
+}
+
+const apiCache = new SimpleMemoryCache(500);
+
+const YOUTUBE_FETCH_HEADERS = {
+  'User-Agent':
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+};
+
 // Helper to decode unicode and HTML escape sequences safely
 function sanitizeText(raw: string): string {
   if (!raw) return '';
@@ -101,25 +149,27 @@ function formatSeconds(totalSeconds: number): string {
   return `${mins}:${paddedSec}`;
 }
 
-// Canonical YouTube Video Metadata Fetcher
+// Canonical YouTube Video Metadata Fetcher with TTL Cache
 async function fetchCanonicalVideoMetadata(idOrUrl: string) {
   const vid = extractYouTubeVideoId(idOrUrl);
   if (!vid) {
     return { error: 'Invalid YouTube Video ID', valid: false };
   }
 
+  const cacheKey = `video:${vid}`;
+  const cached = apiCache.get<any>(cacheKey);
+  if (cached) return cached;
+
   try {
     const oembedUrl = `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${vid}&format=json`;
     const oembedRes = await fetch(oembedUrl, {
       signal: AbortSignal.timeout(5000),
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
-      },
+      headers: YOUTUBE_FETCH_HEADERS,
     });
 
     if (!oembedRes.ok) {
       const isDeletedOrPrivate = oembedRes.status === 404 || oembedRes.status === 401;
-      return {
+      const result = {
         id: vid,
         youtubeVideoId: vid,
         youtubeUrl: `https://www.youtube.com/watch?v=${vid}`,
@@ -141,6 +191,8 @@ async function fetchCanonicalVideoMetadata(idOrUrl: string) {
         addedAt: Date.now(),
         updatedAt: Date.now(),
       };
+      apiCache.set(cacheKey, result, 5 * 60 * 1000);
+      return result;
     }
 
     const oembedData = await oembedRes.json();
@@ -153,10 +205,7 @@ async function fetchCanonicalVideoMetadata(idOrUrl: string) {
       const searchUrl = `https://www.youtube.com/results?search_query=${vid}`;
       const searchRes = await fetch(searchUrl, {
         signal: AbortSignal.timeout(4000),
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-          'Accept-Language': 'en-US,en;q=0.9',
-        },
+        headers: YOUTUBE_FETCH_HEADERS,
       });
       const html = await searchRes.text();
       const vRegex = new RegExp(`"videoId":"${vid}".*?"lengthText":\\{.*?"simpleText":"(.*?)"\\}`, 's');
@@ -171,7 +220,7 @@ async function fetchCanonicalVideoMetadata(idOrUrl: string) {
     const duration = formatSeconds(durationSeconds);
     const thumbnailUrl = `https://i.ytimg.com/vi/${vid}/hqdefault.jpg`;
 
-    return {
+    const result = {
       id: vid,
       youtubeVideoId: vid,
       youtubeUrl: `https://www.youtube.com/watch?v=${vid}`,
@@ -190,6 +239,9 @@ async function fetchCanonicalVideoMetadata(idOrUrl: string) {
       addedAt: Date.now(),
       updatedAt: Date.now(),
     };
+
+    apiCache.set(cacheKey, result, 30 * 60 * 1000);
+    return result;
   } catch (err: any) {
     return {
       error: err.message || 'Failed to fetch video metadata',
@@ -200,7 +252,7 @@ async function fetchCanonicalVideoMetadata(idOrUrl: string) {
 }
 
 // Health check route
-app.get('/api/health', (req, res) => {
+app.get('/api/health', (_req, res) => {
   res.json({ status: 'ok', timestamp: Date.now() });
 });
 
@@ -209,6 +261,7 @@ app.get('/api/youtube/video/:id', async (req, res) => {
   try {
     const id = req.params.id;
     const result = await fetchCanonicalVideoMetadata(id);
+    res.setHeader('Cache-Control', 'public, max-age=300');
     return res.json(result);
   } catch (error: any) {
     return res.status(500).json({ error: 'Server error', message: error.message });
@@ -226,6 +279,7 @@ app.get('/api/youtube/video-metadata', async (req, res) => {
     if ((result as any).error && !(result as any).id) {
       return res.status(400).json(result);
     }
+    res.setHeader('Cache-Control', 'public, max-age=300');
     return res.json(result);
   } catch (error: any) {
     return res.status(500).json({ error: 'Server error', message: error.message });
@@ -267,25 +321,32 @@ app.get('/api/youtube/search', async (req, res) => {
       return res.json({ videos: [], playlists: [], results: [] });
     }
 
+    const cacheKey = `search:${query.toLowerCase()}`;
+    const cached = apiCache.get<any>(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=180');
+      return res.json(cached);
+    }
+
     // Direct YouTube video ID or URL entered in search box
     const directVid = extractYouTubeVideoId(query);
     if (directVid) {
       const canonical = await fetchCanonicalVideoMetadata(directVid);
       if (!(canonical as any).error || (canonical as any).id) {
-        return res.json({
+        const payload = {
           videos: [canonical],
           playlists: [],
           results: [canonical],
-        });
+        };
+        apiCache.set(cacheKey, payload, 10 * 60 * 1000);
+        return res.json(payload);
       }
     }
 
     const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
     const ytRes = await fetch(searchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+      signal: AbortSignal.timeout(6000),
+      headers: YOUTUBE_FETCH_HEADERS,
     });
 
     const text = await ytRes.text();
@@ -300,7 +361,7 @@ app.get('/api/youtube/search', async (req, res) => {
       try {
         const initialData = JSON.parse(initDataMatch[1]);
         const findItems = (obj: any) => {
-          if (!obj || typeof obj !== 'object') return;
+          if (!obj || typeof obj !== 'object' || (videos.length >= 30 && playlists.length >= 10)) return;
           if (obj.videoRenderer) {
             const vr = obj.videoRenderer;
             const vid = vr.videoId;
@@ -462,7 +523,10 @@ app.get('/api/youtube/search', async (req, res) => {
       }
     }
 
-    return res.json({ videos, playlists, results: videos });
+    const payload = { videos, playlists, results: videos };
+    apiCache.set(cacheKey, payload, 10 * 60 * 1000);
+    res.setHeader('Cache-Control', 'public, max-age=180');
+    return res.json(payload);
   } catch (error: any) {
     console.error('YouTube search error:', error);
     return res.status(500).json({ error: 'Failed to search YouTube', message: error.message });
@@ -475,12 +539,17 @@ app.get('/api/youtube/playlists-search', async (req, res) => {
     const query = (req.query.q as string || '').trim();
     if (!query) return res.json({ playlists: [] });
 
+    const cacheKey = `playlist-search:${query.toLowerCase()}`;
+    const cached = apiCache.get<any>(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=180');
+      return res.json(cached);
+    }
+
     const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}&sp=EgIQAw%253D%253D`;
     const ytRes = await fetch(searchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+      signal: AbortSignal.timeout(6000),
+      headers: YOUTUBE_FETCH_HEADERS,
     });
 
     const text = await ytRes.text();
@@ -492,7 +561,7 @@ app.get('/api/youtube/playlists-search', async (req, res) => {
       try {
         const initialData = JSON.parse(initDataMatch[1]);
         const findPlaylists = (obj: any) => {
-          if (!obj || typeof obj !== 'object') return;
+          if (!obj || typeof obj !== 'object' || playlists.length >= 15) return;
           if (obj.lockupViewModel && (obj.lockupViewModel.contentType === 'LOCKUP_CONTENT_TYPE_PLAYLIST' || (obj.lockupViewModel.contentId && obj.lockupViewModel.contentId.startsWith('PL')))) {
             const l = obj.lockupViewModel;
             const pid = l.contentId;
@@ -539,7 +608,10 @@ app.get('/api/youtube/playlists-search', async (req, res) => {
       }
     }
 
-    return res.json({ playlists });
+    const payload = { playlists };
+    apiCache.set(cacheKey, payload, 10 * 60 * 1000);
+    res.setHeader('Cache-Control', 'public, max-age=180');
+    return res.json(payload);
   } catch (error: any) {
     console.error('Playlist search error:', error);
     return res.status(500).json({ error: 'Failed to search playlists', message: error.message });
@@ -550,13 +622,17 @@ app.get('/api/youtube/playlists-search', async (req, res) => {
 app.get('/api/youtube/playlist', async (req, res) => {
   try {
     const playlistId = (req.query.id as string || 'PLnpeBC6D538X9YVEXlKMSL1Qwsa0sbtt4').trim();
-    const url = `https://www.youtube.com/playlist?list=${playlistId}`;
+    const cacheKey = `playlist:${playlistId}`;
+    const cached = apiCache.get<any>(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return res.json(cached);
+    }
 
+    const url = `https://www.youtube.com/playlist?list=${playlistId}`;
     const ytRes = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+      signal: AbortSignal.timeout(7000),
+      headers: YOUTUBE_FETCH_HEADERS,
     });
 
     const html = await ytRes.text();
@@ -570,7 +646,7 @@ app.get('/api/youtube/playlist', async (req, res) => {
         const initialData = JSON.parse(initDataMatch[1]);
         const lockups: any[] = [];
         const findLockups = (obj: any) => {
-          if (!obj || typeof obj !== 'object') return;
+          if (!obj || typeof obj !== 'object' || lockups.length >= 60) return;
           if (obj.lockupViewModel) lockups.push(obj.lockupViewModel);
           if (obj.playlistVideoRenderer) lockups.push({ playlistVideoRenderer: obj.playlistVideoRenderer });
           for (const k of Object.keys(obj)) findLockups(obj[k]);
@@ -598,7 +674,7 @@ app.get('/api/youtube/playlist', async (req, res) => {
             vid = l.contentId || l.rendererContext?.commandContext?.onTap?.innertubeCommand?.watchEndpoint?.videoId || '';
             title = l.metadata?.lockupMetadataViewModel?.title?.content || '';
             channel = l.metadata?.lockupMetadataViewModel?.metadata?.contentMetadataViewModel?.metadataRows?.[0]?.metadataParts?.[0]?.text?.content || '';
-            
+
             const label = l.rendererContext?.accessibilityContext?.label || '';
             if (label) {
               const durMatch = label.match(/(\d+\s*(?:hour|hours|minute|minutes|second|seconds).*)/i);
@@ -685,7 +761,12 @@ app.get('/api/youtube/playlist', async (req, res) => {
       }
     }
 
-    return res.json({ playlistId, tracks });
+    const payload = { playlistId, tracks };
+    if (tracks.length > 0) {
+      apiCache.set(cacheKey, payload, 15 * 60 * 1000);
+    }
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    return res.json(payload);
   } catch (error: any) {
     console.error('Playlist fetch error:', error);
     return res.status(500).json({ error: 'Failed to fetch playlist', message: error.message });
@@ -717,6 +798,13 @@ app.post('/api/youtube/recommendations', async (req, res) => {
       ? keywordList.slice(0, 3).join(' ') + ' acoustic romantic songs'
       : 'soulful romantic acoustic songs';
 
+    const cacheKey = `recs:${querySeed.toLowerCase()}`;
+    const cached = apiCache.get<any>(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'public, max-age=300');
+      return res.json(cached);
+    }
+
     // Optional: Enhance with Gemini AI if API key is provided
     if (process.env.GEMINI_API_KEY) {
       try {
@@ -738,17 +826,14 @@ app.post('/api/youtube/recommendations', async (req, res) => {
 
     const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(querySeed)}`;
     const ytRes = await fetch(searchUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Accept-Language': 'en-US,en;q=0.9',
-      },
+      signal: AbortSignal.timeout(6000),
+      headers: YOUTUBE_FETCH_HEADERS,
     });
 
     const text = await ytRes.text();
     const recommendations: any[] = [];
     const seen = new Set<string>();
 
-    // Strategy 1: Parse ytInitialData
     const initDataMatch = text.match(/var ytInitialData = ({.*?});<\/script>/s) || text.match(/ytInitialData\s*=\s*({.+?});/);
     if (initDataMatch) {
       try {
@@ -831,7 +916,6 @@ app.post('/api/youtube/recommendations', async (req, res) => {
       }
     }
 
-    // Strategy 2: Regex fallback
     if (recommendations.length === 0) {
       const vRegex = /"videoRenderer":\{(.*?)"navigationEndpoint"/gs;
       let vMatch;
@@ -876,7 +960,10 @@ app.post('/api/youtube/recommendations', async (req, res) => {
       }
     }
 
-    return res.json({ seed: querySeed, recommendations });
+    const payload = { seed: querySeed, recommendations };
+    apiCache.set(cacheKey, payload, 15 * 60 * 1000);
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    return res.json(payload);
   } catch (error: any) {
     console.error('Recommendations error:', error);
     return res.status(500).json({ error: 'Failed to get recommendations', message: error.message });
@@ -894,7 +981,7 @@ async function start() {
   } else {
     const distPath = path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
@@ -904,4 +991,11 @@ async function start() {
   });
 }
 
-start();
+if (!process.env.VERCEL) {
+  start();
+}
+
+export { app };
+export default app;
+
+
